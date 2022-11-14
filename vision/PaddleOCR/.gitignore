@@ -19,6 +19,8 @@ output/
 *.idea
 
 *.log
+.clang-format
+.clang_format.hook
 
 build/
 dist/
