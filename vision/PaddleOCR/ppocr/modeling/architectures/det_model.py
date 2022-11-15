@@ -68,6 +68,7 @@ class DetModel(object):
         image = fluid.layers.data(
             name='image', shape=image_shape, dtype='float32')
         image.stop_gradient = False
+        feed_list =[]
         if mode == "train":
             if self.algorithm == "EAST":
                 h, w = int(image_shape[1] // 4), int(image_shape[2] // 4)
@@ -118,15 +119,12 @@ class DetModel(object):
                     'input_mask': input_mask,\
                     'input_tvo': input_tvo,\
                     'input_tco': input_tco}
-            loader = fluid.io.DataLoader.from_generator(
-                feed_list=feed_list,
-                capacity=64,
-                use_double_buffer=True,
-                iterable=False)
+            loader = None
         else:
             labels = None
             loader = None
-        return image, labels, loader
+            feed_list = [image]
+        return image, labels, loader, feed_list
 
     def __call__(self, mode):
         """
@@ -135,7 +133,8 @@ class DetModel(object):
             mode (str): 'train' for training; 'export'  for inference,
                 others for evaluation]
         """
-        image, labels, loader = self.create_feed(mode)
+        image, labels, loader, feed_list = self.create_feed(mode)
+        predicts = {}
         conv_feas = self.backbone(image)
         if self.algorithm == "DB":
             predicts = self.head(conv_feas, mode)
@@ -143,8 +142,8 @@ class DetModel(object):
             predicts = self.head(conv_feas)
         if mode == "train":
             losses = self.loss(predicts, labels)
-            return loader, losses
+            return loader, losses, feed_list
         elif mode == "export":
             return [image, predicts]
         else:
-            return loader, predicts
+            return loader, predicts, feed_list

@@ -34,6 +34,8 @@ from eval_utils.eval_cls_utils import eval_cls_run
 from ppocr.utils.save_load import save_model
 import numpy as np
 from ppocr.utils.character import cal_predicts_accuracy, cal_predicts_accuracy_srn, CharacterOps
+import paddle.distributed.fleet as fleet
+from paddle.distributed.fleet.distributed_utils import get_rank, get_world_size
 
 
 class ArgsParser(ArgumentParser):
@@ -149,6 +151,24 @@ def check_gpu(use_gpu):
     except Exception as e:
         pass
 
+def check_gcu(use_gcu):
+    """
+    Log error and exit when set use_gcu=true in paddlepaddle
+    cpu version.
+    """
+    err = "Config use_gcu cannot be set as true while you are " \
+          "using paddlepaddle cpu version ! \nPlease try: \n" \
+          "\t1. Install paddlepaddle-gcu to run model on GCU \n" \
+          "\t2. Set use_gcu as false in config file to run " \
+          "model on CPU"
+
+    try:
+        if use_gcu and not fluid.is_compiled_with_gcu():
+            logger.error(err)
+            sys.exit(1)
+    except Exception as e:
+        pass
+
 
 def build(config, main_prog, startup_prog, mode):
     """
@@ -172,7 +192,7 @@ def build(config, main_prog, startup_prog, mode):
         with fluid.unique_name.guard():
             func_infor = config['Architecture']['function']
             model = create_module(func_infor)(params=config)
-            dataloader, outputs = model(mode=mode)
+            dataloader, outputs, feed_list = model(mode=mode)
             fetch_name_list = list(outputs.keys())
             fetch_varname_list = [outputs[v].name for v in fetch_name_list]
             opt_loss_name = None
@@ -188,9 +208,16 @@ def build(config, main_prog, startup_prog, mode):
                 #word_loss_name = word_loss.name
                 opt_params = config['Optimizer']
                 optimizer = create_module(opt_params['function'])(opt_params)
+                use_gcu = config['Global']['use_gcu']
+                distributed_gcu = use_gcu and get_world_size() > 1
+                if distributed_gcu:
+                    optimizer = fleet.distributed_optimizer(optimizer)
                 optimizer.minimize(opt_loss)
                 opt_loss_name = opt_loss.name
-                global_lr = optimizer._global_learning_rate()
+                if not distributed_gcu:
+                    global_lr = optimizer._global_learning_rate()
+                else:
+                    global_lr = optimizer.user_defined_optimizer._global_learning_rate()
                 fetch_name_list.insert(0, "lr")
                 fetch_varname_list.insert(0, global_lr.name)
                 if "loss_type" in config["Global"]:
@@ -203,7 +230,7 @@ def build(config, main_prog, startup_prog, mode):
                                 'max_average_window'])
 
     return (dataloader, fetch_name_list, fetch_varname_list, opt_loss_name,
-            model_average)
+            model_average, feed_list)
 
 
 def build_export(config, main_prog, startup_prog):
@@ -270,6 +297,7 @@ def train_eval_det_run(config,
         eval_info_dict: information dict for evaluation
     """
     train_batch_id = 0
+    rank = get_rank()
     log_smooth_window = config['Global']['log_smooth_window']
     epoch_num = config['Global']['epoch_num']
     print_batch_step = config['Global']['print_batch_step']
@@ -292,11 +320,11 @@ def train_eval_det_run(config,
     best_epoch = 0
     train_loader = train_info_dict['reader']
     for epoch in range(epoch_num):
-        train_loader.start()
         try:
-            while True:
+            for data in train_loader():
                 t1 = time.time()
                 train_outs = exe.run(
+                    feed = data,
                     program=train_info_dict['compile_program'],
                     fetch_list=train_info_dict['fetch_varname_list'],
                     return_numpy=False)
@@ -308,14 +336,14 @@ def train_eval_det_run(config,
                 t2 = time.time()
                 train_batch_elapse = t2 - t1
                 train_stats.update(stats)
-                if train_batch_id > 0 and train_batch_id  \
+                if train_batch_id >= 0 and train_batch_id  \
                     % print_batch_step == 0:
                     logs = train_stats.log()
                     strs = 'epoch: {}, iter: {}, {}, time: {:.3f}'.format(
                         epoch, train_batch_id, logs, train_batch_elapse)
                     logger.info(strs)
 
-                if train_batch_id > start_eval_step and\
+                if rank == 0 and train_batch_id > start_eval_step and\
                     (train_batch_id - start_eval_step) % eval_batch_step == 0:
                     metrics = eval_det_run(exe, config, eval_info_dict, "eval")
                     hmean = metrics['hmean']
@@ -347,7 +375,7 @@ def train_eval_det_run(config,
 
         except fluid.core.EOFException:
             train_loader.reset()
-        if epoch == 0 and save_epoch_step == 1:
+        if rank == 0 and epoch == 0 and save_epoch_step == 1:
             save_path = save_model_dir + "/iter_epoch_0"
             if is_slim is None:
                 save_model(train_info_dict['train_program'], save_path)
@@ -362,7 +390,7 @@ def train_eval_det_run(config,
                     raise ValueError(
                         "Only quant and prune are supported currently. But received {}".
                         format(is_slim))
-        if epoch > 0 and epoch % save_epoch_step == 0:
+        if rank == 0 and epoch > 0 and epoch % save_epoch_step == 0:
             save_path = save_model_dir + "/iter_epoch_%d" % (epoch)
             if is_slim is None:
                 save_model(train_info_dict['train_program'], save_path)
@@ -658,6 +686,9 @@ def preprocess():
     # check if set use_gpu=True in paddlepaddle cpu version
     use_gpu = config['Global']['use_gpu']
     check_gpu(use_gpu)
+    use_gcu = config['Global']['use_gcu']
+    if use_gcu:
+        check_gcu(use_gcu)
 
     # check whether the set algorithm belongs to the supported algorithm list
     alg = config['Global']['algorithm']
@@ -668,6 +699,8 @@ def preprocess():
         config['Global']['char_ops'] = CharacterOps(config['Global'])
 
     place = fluid.CUDAPlace(0) if use_gpu else fluid.CPUPlace()
+    gcu_id = int(os.environ.get('FLAGS_selected_gcus', 0))
+    place = fluid.GCUPlace(gcu_id) if use_gcu else place
     startup_program = fluid.Program()
     train_program = fluid.Program()
 

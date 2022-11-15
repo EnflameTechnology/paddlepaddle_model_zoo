@@ -44,6 +44,8 @@ logger = initial_logger()
 from ppocr.data.reader_main import reader_main
 from ppocr.utils.save_load import init_model
 from paddle.fluid.contrib.model_stat import summary
+import paddle.distributed.fleet as fleet
+from paddle.distributed.fleet.distributed_utils import get_world_size
 
 
 def main():
@@ -54,7 +56,8 @@ def main():
     train_fetch_name_list = train_build_outputs[1]
     train_fetch_varname_list = train_build_outputs[2]
     train_opt_loss_name = train_build_outputs[3]
-    model_average = train_build_outputs[-1]
+    model_average = train_build_outputs[4]
+    feed_list = train_build_outputs[-1]
 
     # build eval program
     eval_program = fluid.Program()
@@ -65,6 +68,11 @@ def main():
     eval_program = eval_program.clone(for_test=True)
 
     # initialize train reader
+    train_loader = fluid.io.DataLoader.from_generator(
+        feed_list=feed_list,
+        capacity=16,
+        use_double_buffer=True,
+        iterable=True)
     train_reader = reader_main(config=config, mode="train")
     train_loader.set_sample_list_generator(train_reader, places=place)
 
@@ -73,10 +81,13 @@ def main():
 
     exe = fluid.Executor(place)
     exe.run(startup_program)
-
-    # compile program for multi-devices
-    train_compile_program = program.create_multi_devices_program(
-        train_program, train_opt_loss_name)
+    use_gcu = config['Global']['use_gcu']
+    if not use_gcu:
+        # compile program for multi-devices
+        train_compile_program = program.create_multi_devices_program(
+            train_program, train_opt_loss_name)
+    else:
+        train_compile_program = train_program
 
     # dump mode structure
     if config['Global']['debug']:
@@ -86,7 +97,7 @@ def main():
         else:
             summary(train_program)
 
-    init_model(config, train_program, exe)
+    # init_model(config, train_program, exe)
 
     train_info_dict = {'compile_program':train_compile_program,\
         'train_program':train_program,\
@@ -131,6 +142,11 @@ if __name__ == '__main__':
     enable_static_mode()
     startup_program, train_program, place, config, train_alg_type = program.preprocess(
     )
+    use_gcu = config['Global']['use_gcu']
+    distributed_gcu = use_gcu and get_world_size() > 1
+    if distributed_gcu:
+        strategy = fleet.DistributedStrategy()
+        fleet.init(is_collective=True, strategy=strategy)
     # run the train process
     main()
     # if you want to check the reader, you can comment `main` and run test_reader

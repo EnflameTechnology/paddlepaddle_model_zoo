@@ -1,9 +1,10 @@
 Global:
   algorithm: DB
-  use_gpu: true
+  use_gpu: false
+  use_gcu: true
   epoch_num: 1200
   log_smooth_window: 20
-  print_batch_step: 2
+  print_batch_step: 1
   save_model_dir: ./output/det_db/
   save_epoch_step: 200
   # evaluation is run every 5000 iterations after the 4000th iteration
@@ -35,7 +36,7 @@ Head:
 
 Loss:
   function: ppocr.modeling.losses.det_db_loss,DBLoss
-  balance_loss: true
+  balance_loss: false
   main_loss_type: DiceLoss
   alpha: 5
   beta: 10

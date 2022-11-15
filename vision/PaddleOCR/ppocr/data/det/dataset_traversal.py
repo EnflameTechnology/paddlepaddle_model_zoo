@@ -25,6 +25,7 @@ logger = initial_logger()
 from ppocr.utils.utility import create_module
 from ppocr.utils.utility import get_image_file_list
 import time
+from paddle.distributed.fleet.distributed_utils import get_rank, get_world_size
 
 
 class TrainReader(object):
@@ -40,24 +41,40 @@ class TrainReader(object):
         assert 'process_function' in params,\
             "absence process_function in Reader"
         self.process = create_module(params['process_function'])(params)
+        self.rank = get_rank()
+        self.world_size = get_world_size()
 
     def __call__(self, process_id):     
         def sample_iter_reader():
             with open(self.label_file_path, "rb") as fin:
                 label_infor_list = fin.readlines()
             img_num = len(label_infor_list)
+            img_num = (img_num // self.world_size) * self.world_size  # Deadlock avoidance
             img_id_list = list(range(img_num))
+            img_id_list = list(
+                filter(lambda x: x % self.world_size == self.rank, img_id_list))
+            local_img_num = len(img_id_list)
             random.shuffle(img_id_list)
+            random.shuffle(label_infor_list)
             if sys.platform == "win32" and self.num_workers != 1:
                 print("multiprocess is not fully compatible with Windows."
                       "num_workers will be 1.")
                 self.num_workers = 1
-            for img_id in range(process_id, img_num, self.num_workers):
-                label_infor = label_infor_list[img_id_list[img_id]]
-                outs = self.process(label_infor)
-                if outs is None:
-                    continue
-                yield outs
+
+            batch_count = math.ceil(local_img_num / self.batch_size)
+            for batch_idx in range(0, batch_count, self.num_workers):
+                start = (batch_idx * self.batch_size) + (process_id *
+                                                         self.batch_size)
+                for inner_idx in range(self.batch_size):
+                    img_id = start + inner_idx
+                    if img_id >= local_img_num:
+                        break
+                    # process
+                    label_infor = label_infor_list[img_id_list[img_id]]
+                    outs = self.process(label_infor)
+                    if outs is None:
+                        continue
+                    yield outs
 
         def sample_iter_reader_mul():
             batch_size = 1000
@@ -161,7 +178,8 @@ class EvalTestReader(object):
                 if len(batch_outs) == batch_size:
                     yield batch_outs
                     batch_outs = []
-            if len(batch_outs) != 0:
-                yield batch_outs
+            # drop last
+            # if len(batch_outs) != 0:
+            #     yield batch_outs
 
         return batch_iter_reader
