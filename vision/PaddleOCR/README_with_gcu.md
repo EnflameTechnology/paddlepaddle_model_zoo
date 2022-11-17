@@ -1,3 +1,5 @@
+Copyright (c) 2022 Enflame Authors. All Rights Reserved.
+
 ## 简介
 在GCU设备上应用DBNET网络，基于[PaddleOCR](README_ch.md)。
 
